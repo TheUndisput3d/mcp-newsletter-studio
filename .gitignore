@@ -1,0 +1,51 @@
+# Credentials, OAuth material, and local provider settings
+.env
+.env.*
+!.env.example
+secrets/
+config.local.yaml
+config.*.local.yaml
+*.pem
+*.key
+*token*.json
+*oauth*.json
+
+# Generated newsletter runs and local state
+workspace/
+examples/demo-output/
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+
+# Python tooling and build output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated test reports and browser recordings
+docs/test-results/
+docs/browser-check-results.json
+docs/assets/demo/
+docs/dashboard-preview.png
+docs/dashboard-mobile-preview.png
+docs/review-preview.png
+docs/ORIGINAL_SPECIFICATION.md
+RELEASE_MANIFEST.json
