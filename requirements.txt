@@ -1,0 +1,2 @@
+# Install the local project and its declared runtime dependencies.
+-e .
