@@ -1,0 +1,186 @@
+# Non-secret defaults. Dashboard saves overrides to config.local.yaml.
+newsletter:
+  name: The AI Dispatch
+  audience: Developers and technically curious AI practitioners
+  author: Editorial Team
+  timezone: Asia/Kathmandu
+  lookback_days: 7
+  topics:
+  - open-source AI
+  - AI developer tools
+  workspace: workspace
+  max_items_per_channel: 6
+  max_search_calls: 3
+  max_llm_calls: 30
+  max_input_characters: 100000
+  max_output_tokens: 7000
+  require_web_sources: true
+  include_undated_sources: false
+  allow_cloud_context: false
+  calendar_query: AI Newsletter
+  calendar_id: primary
+  drive_folder_id: ''
+  drive_document_names:
+  - AI Newsletter Performance Data
+  - AI Newsletter Content Ideas
+  - Sample Newsletter Template
+  gmail_query: newer_than:30d {"newsletter feedback" "content suggestion"}
+  arxiv_query: cat:cs.AI OR cat:cs.LG OR cat:cs.CL
+  github_query: topic:artificial-intelligence archived:false fork:false stars:>100
+  producthunt_topic: AI
+  twitter_query: (AI OR "machine learning") lang:en -is:retweet
+llm:
+  provider: ollama
+  ollama_model: qwen3:8b
+  ollama_base_url: http://127.0.0.1:11434
+  groq_model: openai/gpt-oss-120b
+  gemini_model: gemini-3.8-flash
+  openai_model: gpt-5-mini
+  claude_model: claude-sonnet-4-6
+  fallback_provider: ''
+  timeout_seconds: 300
+  heavy_timeout_seconds: 900
+  task_deadline_seconds: 2400
+  request_retries: 4
+  validation_attempts: 3
+  max_rate_wait_seconds: 180
+  temperature: 0.2
+  small_task_max_tokens: 1200
+  key_pools: {}
+  quotas: {}
+mcps:
+  tavily:
+    enabled: true
+    required: true
+    transport: streamable_http
+    authentication: bearer
+    url: https://mcp.tavily.com/mcp/
+    token_env: TAVILY_API_KEY
+    command: ''
+    args: []
+    environment: {}
+    operations:
+      search: tavily_search
+    timeout_seconds: 90
+  arxiv:
+    enabled: true
+    required: false
+    transport: streamable_http
+    authentication: none
+    url: https://arxiv.caseyjhand.com/mcp
+    token_env: ''
+    command: ''
+    args: []
+    environment: {}
+    operations:
+      search_papers: arxiv_search_papers
+    timeout_seconds: 90
+  github:
+    enabled: true
+    required: false
+    transport: streamable_http
+    authentication: bearer
+    url: https://api.githubcopilot.com/mcp/
+    token_env: GITHUB_TOKEN
+    command: ''
+    args: []
+    environment: {}
+    operations:
+      search_repositories: search_repositories
+    timeout_seconds: 90
+  producthunt:
+    enabled: true
+    required: false
+    transport: streamable_http
+    authentication: oauth
+    url: https://mcp.producthunt.com/mcp
+    token_env: PRODUCTHUNT_MCP_ACCESS_TOKEN
+    command: ''
+    args: []
+    environment: {}
+    operations:
+      search_products: search_launches
+    timeout_seconds: 90
+  google_drive:
+    enabled: true
+    required: false
+    transport: stdio
+    authentication: oauth
+    url: ''
+    token_env: GOOGLE_ACCESS_TOKEN
+    command: python
+    args: ['-m', 'newsletter_mcp.google_mcp', 'google_drive']
+    environment: {}
+    operations:
+      find_files: search_files
+      read_file: read_file_content
+    timeout_seconds: 90
+  gmail:
+    enabled: true
+    required: false
+    transport: stdio
+    authentication: oauth
+    url: ''
+    token_env: GOOGLE_ACCESS_TOKEN
+    command: python
+    args: ['-m', 'newsletter_mcp.google_mcp', 'gmail']
+    environment: {}
+    operations:
+      search_feedback: search_feedback
+    timeout_seconds: 90
+  google_calendar:
+    enabled: true
+    required: false
+    transport: stdio
+    authentication: oauth
+    url: ''
+    token_env: GOOGLE_ACCESS_TOKEN
+    command: python
+    args: ['-m', 'newsletter_mcp.google_mcp', 'google_calendar']
+    environment: {}
+    operations:
+      upcoming_events: upcoming_events
+    timeout_seconds: 90
+  filesystem:
+    enabled: true
+    required: true
+    transport: stdio
+    authentication: none
+    url: ''
+    token_env: ''
+    command: npx
+    args: ['-y', '@modelcontextprotocol/server-filesystem@2025.11.25', '${workspace}']
+    environment: {}
+    operations:
+      read_text: read_text_file
+      write_text: write_file
+      create_directory: create_directory
+    timeout_seconds: 90
+  twitter:
+    enabled: true
+    required: false
+    transport: streamable_http
+    authentication: bearer
+    url: https://api.x.com/mcp
+    token_env: X_BEARER_TOKEN
+    command: ''
+    args: []
+    environment: {}
+    operations:
+      search_posts: search_posts_all
+    timeout_seconds: 90
+schedule:
+  weekday: 6
+  hour: 8
+  minute: 0
+research_fallback:
+  producthunt_to_tavily: true
+  twitter_to_tavily: true
+  allow_undated: true
+  max_searches_per_channel: 1
+features:
+  allow_jinja_fallback: false
+phase3:
+  mode: llm
+  max_output_tokens: 16000
+  validate_content_preservation: true
