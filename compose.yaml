@@ -1,0 +1,31 @@
+services:
+  studio:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:?Set a strong DASHBOARD_TOKEN in your host .env before starting Docker}
+      DASHBOARD_HOST: 127.0.0.1
+      OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+      NEWSLETTER_WORKSPACE: /data/workspace
+      NEWSLETTER_SETTINGS_FILE: /data/settings.yaml
+      NEWSLETTER_SECRETS_FILE: /data/secrets/.env
+      MCP_OAUTH_FILE: /data/secrets/mcp_oauth.json
+      GOOGLE_CREDENTIALS_FILE: /run/secrets/google_client.json
+    network_mode: host
+    group_add:
+      - "${HOST_GID:-1000}"
+    volumes:
+      - studio-data:/data
+      - /home/aayush/Documents/newsletter:/data/workspace
+      - ./secrets/client_secret.json:/run/secrets/google_client.json:ro
+    restart: unless-stopped
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    profiles: [local-model]
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+volumes:
+  studio-data:
+  ollama-models:
