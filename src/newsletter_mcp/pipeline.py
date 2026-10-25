@@ -1,0 +1,586 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Callable
+from zoneinfo import ZoneInfo
+
+from filelock import FileLock, Timeout
+
+from newsletter_mcp import demo as fixtures
+from newsletter_mcp.config import Settings, LLM_MODES
+from newsletter_mcp.llm import LLMClient
+from newsletter_mcp.email_builder import build_email, eml_package, validate_markdown
+from newsletter_mcp.models import Draft, FocusPlan, Source, canonical_url, utc_now, validate_references
+from newsletter_mcp.staged_draft import build_staged_draft
+from newsletter_mcp.protocol import MCPClient
+from newsletter_mcp.registry import MCPHub, external_environment
+from newsletter_mcp.render import render_issue
+from newsletter_mcp.state import StateStore
+
+CHANNEL_SERVERS = {"web": "tavily", "arxiv": "arxiv", "github": "github",
+                   "producthunt": "producthunt", "twitter": "twitter"}
+RESEARCH_FILES = {"web": "web_research.md", "arxiv": "arxiv_research.md", "github": "github_research.md",
+                  "producthunt": "product_hunt_research.md", "twitter": "twitter_research.md"}
+RUN_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}-[a-f0-9]{8}$")
+
+
+class PipelineError(RuntimeError):
+    pass
+
+
+def next_schedule(settings: Settings, after: datetime | None = None) -> datetime:
+    zone = ZoneInfo(settings.newsletter.timezone)
+    now = (after or datetime.now(timezone.utc)).astimezone(zone)
+    s = settings.schedule
+    candidate = (now + timedelta(days=(s.weekday - now.weekday()) % 7)).replace(
+        hour=s.hour, minute=s.minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def dump(value) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
+def valid_run_id(identifier: str):
+    if not RUN_PATTERN.fullmatch(identifier):
+        raise PipelineError("Invalid run identifier")
+
+
+def parsed_datetime(value: str) -> datetime:
+    value = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def normalize_sources(channel: str, records: list[dict], start: datetime, end: datetime,
+                      include_undated: bool, seen: set[str], limit: int) -> tuple[list[Source], list[str]]:
+    sources, exclusions = [], []
+    for raw in records:
+        try:
+            source = Source.from_record(channel, raw)
+            canonical = canonical_url(source.url)
+            if canonical in seen:
+                continue
+            if source.published_at:
+                try:
+                    stamp = parsed_datetime(source.published_at)
+                except (ValueError, TypeError, OverflowError):
+                    source.published_at = None
+                else:
+                    if stamp < start or stamp > end:
+                        exclusions.append(f"Outside research window: {source.title}")
+                        continue
+                    source.published_at = stamp.isoformat()
+            if not source.published_at:
+                if not include_undated:
+                    exclusions.append(f"Unknown publication/activity date: {source.title}")
+                    continue
+                source.metadata["date_warning"] = "Date unknown; not verified as published in this issue's window"
+            pdf = source.metadata.get("pdf_url")
+            if pdf:
+                from newsletter_mcp.models import safe_url
+                try:
+                    safe_url(pdf)
+                except (ValueError, TypeError):
+                    source.metadata.pop("pdf_url", None)
+            seen.add(canonical)
+            sources.append(source)
+            if len(sources) >= limit:
+                break
+        except (ValueError, KeyError, TypeError):
+            exclusions.append("Malformed source record discarded")
+    return sources, exclusions
+
+
+def research_markdown(channel: str, sources: list[Source], status: dict, demo: bool) -> str:
+    lines = [f"# {channel} research", "", f"Status: {status['state']}", ""]
+    if demo:
+        lines += ["> SYNTHETIC DEMO. Not real news or real metrics.", ""]
+    if status.get("reason") or not sources:
+        lines += [status.get("reason") or "No qualifying sources.", ""]
+    for source in sources:
+        lines += [f"## {source.title}", "", f"Source ID: `{source.id}`", f"Original URL: {source.url}",
+                  f"Source date: {source.published_at or 'Unknown'}", f"Retrieved: {source.retrieved_at}", "",
+                  source.summary, "", "Metadata:", "```json", dump(source.metadata).rstrip(), "```", ""]
+    return "\n".join(lines)
+
+
+def evidence_for_model(sources: list[Source]) -> list[dict]:
+    # URLs are assembled from trusted records in rendering, not generated by the model.
+    return [{"id": s.id, "channel": s.channel, "title": s.title, "summary": s.summary[:1800],
+             "published_at": s.published_at, "metadata": {k: v for k, v in s.metadata.items()
+                 if k not in {"pdf_url", "website"}}} for s in sources]
+
+
+def primary_web_queries(settings: Settings) -> list[str]:
+    """Build a bounded public-news portfolio instead of repeating bare topics."""
+    topics = settings.newsletter.topics or ["artificial intelligence"]
+    intents = (
+        "latest announcements releases launches research benchmarks",
+        "developer tools open-source repositories production deployment evaluation",
+        "governance safety policy enterprise adoption developer workflows",
+    )
+    return [f"{topics[index % len(topics)]} {intents[index % len(intents)]}"
+            for index in range(settings.newsletter.max_search_calls)]
+
+
+@asynccontextmanager
+async def artifact_client(settings: Settings):
+    config = settings.mcps["filesystem"]
+    if config.transport != "stdio":
+        raise PipelineError("Filesystem MCP must use local stdio transport")
+    args = [arg.replace("${workspace}", str(settings.workspace)) for arg in config.args]
+    async with MCPClient(command=[config.command, *args],
+                         env=external_environment(settings, config.environment), cwd=str(settings.project_root)) as raw:
+        class FilesystemClient:
+            async def call(self, operation: str, arguments: dict):
+                outbound = dict(arguments)
+                if operation == "write_text":
+                    outbound["content"] = outbound.pop("text", "")
+                    outbound.pop("overwrite", None)
+                if isinstance(outbound.get("path"), str):
+                    target = (settings.workspace / outbound["path"]).resolve()
+                    if not target.is_relative_to(settings.workspace):
+                        raise PipelineError("Filesystem path escapes the configured workspace")
+                    outbound["path"] = str(target)
+                    if operation == "write_text":
+                        create = config.operations.get("create_directory", "create_directory")
+                        cursor = settings.workspace
+                        for part in target.parent.relative_to(settings.workspace).parts:
+                            cursor = cursor / part
+                            await raw.call(create, {"path": str(cursor)})
+                result = await raw.call(config.operations.get(operation, operation), outbound)
+                if operation == "read_text" and "text" not in result and isinstance(result.get("content"), str):
+                    return {"text": result["content"]}
+                return result
+        yield FilesystemClient()
+
+
+async def read_artifact(settings: Settings, identifier: str, filename: str) -> str:
+    valid_run_id(identifier)
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        raise PipelineError("Invalid artifact name")
+    async with artifact_client(settings) as client:
+        return (await client.call("read_text", {"path": f"issues/{identifier}/{filename}"}))["text"]
+
+
+def new_run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+
+
+async def tavily_fallback(hub: MCPHub, settings: Settings, channel: str,
+                          start: datetime, end: datetime, max_results: int) -> dict:
+    """Uses the Tavily MCP, never a direct provider API, and records actual provenance."""
+    items = []
+    topics = settings.newsletter.topics[:settings.research_fallback.max_searches_per_channel]
+    for topic in topics or ["artificial intelligence"]:
+        if channel == "producthunt":
+            query = f"New AI product launches official announcements Product Hunt {topic}"
+            domains = None
+        else:
+            query = f"AI researchers developers community discussions {topic}"
+            domains = ["x.com", "twitter.com", "huggingface.co", "news.ycombinator.com"]
+        result = await hub.search_web(query, start.date().isoformat(), end.date().isoformat(), max_results,
+                                     topic="general", include_domains=domains)
+        for raw in result.get("items", []):
+            item = dict(raw)
+            item["metadata"] = dict(raw.get("metadata", {})) | {
+                "retrieval_method": "tavily_fallback", "original_channel": channel,
+                "evidence_level": "public_search_excerpt", "platform_authenticated": False,
+                "date_warning": "An absent publication date is not proof of a launch or post this week"}
+            items.append(item)
+    return {"items": items}
+
+
+async def run_pipeline(settings: Settings, *, demo: bool = False, provider: str | None = None,
+                       progress: Callable[[str], None] | None = None, identifier: str | None = None) -> dict:
+    settings = settings.model_copy(deep=True)
+    if provider:
+        if provider not in LLM_MODES:
+            raise PipelineError("Unknown LLM mode")
+        settings.llm.provider = provider
+    settings.workspace.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(str(settings.workspace / ".pipeline.lock"), timeout=0)
+    try:
+        lock.acquire()
+    except Timeout as exc:
+        raise PipelineError("Another newsletter run or approval is active in this workspace") from exc
+    store = StateStore(settings.workspace)
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=settings.newsletter.lookback_days)
+    identifier = identifier or new_run_id()
+    valid_run_id(identifier)
+    prefix = f"issues/{identifier}/"
+    if not store.get(identifier):
+        store.start(identifier, "demo" if demo else settings.llm.provider, demo)
+    warnings: list[str] = []
+    llm = LLMClient(settings)
+    manifest = {"run_id": identifier, "demo": demo, "created_at": now.isoformat(),
+                "research_start": start.isoformat(), "research_end": now.isoformat(),
+                "timezone": settings.newsletter.timezone, "status": "starting", "files": {},
+                "warnings": warnings, "human_review_required": True}
+    current_phase = "starting"
+    def phase(name: str):
+        nonlocal current_phase
+        current_phase = name
+        store.update(identifier, name, llm_calls=llm.calls)
+        store.event(identifier, name, "Stage entered")
+        if progress:
+            progress(name)
+    try:
+        async with MCPHub(settings, demo=demo) as hub:
+            manifest["mcp_status"] = hub.status
+            async def persist(filename: str, content: str):
+                await hub.write(prefix + filename, content)
+                manifest["files"][filename] = hashlib.sha256(content.encode()).hexdigest()
+            phase("context")
+            for name, config in settings.mcps.items():
+                if config.required and not hub.ready(name):
+                    raise PipelineError(f"Required MCP {name} is not ready: {hub.status.get(name)}")
+            private_context: dict = {"documents": [], "feedback": []}
+            context_summary: dict = {"drive_files": [], "feedback_messages": 0}
+            publication_time = next_schedule(settings, now).isoformat()
+            publication_source = "local schedule fallback"
+            async def optional_call(name: str, tool: str, arguments: dict) -> dict:
+                if not hub.ready(name):
+                    warnings.append(f"{name}: {hub.status.get(name, {}).get('state', 'unavailable')}")
+                    return {}
+                try:
+                    return await hub.call(name, tool, arguments)
+                except Exception as exc:
+                    if settings.mcps[name].required:
+                        raise
+                    warnings.append(f"{name}: {str(exc)[:250]}")
+                    return {}
+            files = await optional_call("google_drive", "find_files", {
+                "names": settings.newsletter.drive_document_names, "folder_id": settings.newsletter.drive_folder_id})
+            seen_names = set()
+            for file in files.get("files", [])[:10]:
+                if file.get("name") in seen_names:
+                    continue
+                seen_names.add(file.get("name"))
+                document = await optional_call("google_drive", "read_file", {"file_id": file["id"], "max_characters": 6000})
+                if document.get("text"):
+                    private_context["documents"].append({"name": file.get("name"), "text": document["text"]})
+                    context_summary["drive_files"].append(file.get("name"))
+                    if document.get("warning"):
+                        warnings.append(document["warning"])
+            feedback = await optional_call("gmail", "search_feedback", {"query": settings.newsletter.gmail_query, "max_results": 5})
+            private_context["feedback"] = [{"subject": m.get("subject"), "text": m.get("text", "")[:2000]}
+                                           for m in feedback.get("messages", [])]
+            context_summary["feedback_messages"] = len(private_context["feedback"])
+            events = await optional_call("google_calendar", "upcoming_events", {
+                "time_min": now.isoformat(), "time_max": (now + timedelta(days=30)).isoformat(),
+                "query": settings.newsletter.calendar_query, "calendar_id": settings.newsletter.calendar_id})
+            for event in events.get("events", []):
+                beginning = event.get("start") or {}
+                raw = beginning.get("dateTime") or beginning.get("date")
+                if raw:
+                    event_time = parsed_datetime(raw)
+                    if not beginning.get("dateTime"):
+                        event_time = datetime.fromisoformat(raw).replace(tzinfo=ZoneInfo(settings.newsletter.timezone))
+                    if event_time >= now:
+                        publication_time, publication_source = event_time.isoformat(), "Google Calendar MCP"
+                        break
+            context_summary.update(publication_time=publication_time, publication_source=publication_source)
+            manifest.update(publication_time=publication_time, publication_source=publication_source)
+            phase("focus")
+            public_brief = {"audience": settings.newsletter.audience, "topics": settings.newsletter.topics,
+                            "issue_date": publication_time[:10], "research_window": [start.isoformat(), now.isoformat()]}
+            plan = fixtures.focus() if demo else await llm.generate(
+                FocusPlan, "Identify 3-4 public-facing editorial themes and short editorial notes. Use performance data and reader requests where available; do not invent metrics. Never include personal identifiers.",
+                public_brief, private_context)
+            # Private-derived focus remains private for any later cross-provider fallback.
+            private_context["focus_plan"] = plan.model_dump()
+            if not settings.newsletter.allow_cloud_context and settings.llm.provider != "ollama":
+                warnings.append("Private Gmail/Drive context and private-derived focus are withheld from cloud models.")
+            phase("research")
+            n = settings.newsletter.max_items_per_channel
+            common = {"start_time": start.isoformat(), "end_time": now.isoformat(), "max_results": n}
+            async def collect(channel: str) -> tuple[str, dict, str]:
+                name = CHANNEL_SERVERS[channel]
+                if not hub.ready(name):
+                    return channel, {}, f"{name} MCP is {hub.status.get(name, {}).get('state', 'unavailable')}; no content was fabricated."
+                try:
+                    if channel == "web":
+                        items = []
+                        # Queries are public, deterministic and date-filtered; Drive/Gmail context is never sent to Tavily.
+                        for query in primary_web_queries(settings):
+                            result = await hub.search_web(query, start.date().isoformat(), now.date().isoformat(), n)
+                            for raw in result.get("items", []):
+                                record = dict(raw)
+                                record["metadata"] = dict(raw.get("metadata", {})) | {
+                                    "retrieval_method": "tavily_primary", "search_query": query,
+                                    "evidence_level": "public_search_excerpt"}
+                                items.append(record)
+                        return channel, {"items": items}, ""
+                    if channel == "arxiv":
+                        result = await hub.call(name, "search_papers", common | {"query": settings.newsletter.arxiv_query})
+                    elif channel == "github":
+                        result = await hub.call(name, "search_repositories", common | {"query": settings.newsletter.github_query})
+                    elif channel == "producthunt":
+                        result = await hub.call(name, "search_products", common | {"topic": settings.newsletter.producthunt_topic})
+                    else:
+                        result = await hub.call(name, "search_posts", common | {"query": settings.newsletter.twitter_query})
+                    return channel, result, ""
+                except Exception as exc:
+                    return channel, {}, f"{name} research failed: {str(exc)[:250]}"
+            collected = await asyncio.gather(*(collect(channel) for channel in CHANNEL_SERVERS))
+            sources: list[Source] = []
+            exclusions, seen, channel_status = [], set(), {}
+            for channel, result, error in collected:
+                selected, dropped = normalize_sources(channel, result.get("items", []), start, now,
+                                                       settings.newsletter.include_undated_sources, seen, n)
+                exclusions.extend(dropped)
+                fallback_used = False
+                fallback_reason = ""
+                use_fallback = channel in {"producthunt", "twitter"} and getattr(settings.research_fallback, channel + "_to_tavily")
+                if not selected and use_fallback:
+                    fallback_reason = error or "Primary returned no qualifying, dated results"
+                    if hub.ready("tavily"):
+                        try:
+                            fallback_result = await tavily_fallback(hub, settings, channel, start, now, n)
+                            selected, fallback_dropped = normalize_sources(channel, fallback_result.get("items", []), start, now,
+                                settings.research_fallback.allow_undated, seen, n)
+                            exclusions.extend(fallback_dropped)
+                            fallback_used = bool(selected)
+                            if not selected:
+                                error = fallback_reason + "; Tavily fallback returned no qualifying sources."
+                        except Exception as exc:
+                            error = fallback_reason + "; Tavily fallback failed: " + str(exc)[:180]
+                    else:
+                        error = fallback_reason + "; Tavily fallback is unavailable."
+                sources.extend(selected)
+                if fallback_used:
+                    reason = "Using Tavily public-web fallback. " + fallback_reason + ". Public excerpts are not authenticated platform data."
+                else:
+                    reason = error or ("No dated, qualifying sources were returned for this research window." if not selected else "")
+                channel_status[channel] = {"state": "available" if selected else "unavailable", "count": len(selected),
+                    "reason": reason, "fallback": fallback_used, "retrieved_via": "tavily" if fallback_used else CHANNEL_SERVERS[channel]}
+                if reason:
+                    warnings.append(channel + ": " + reason)
+                for source in selected:
+                    if channel == "github" and isinstance(source.metadata.get("stars"), int):
+                        source.metadata.update(store.observe_stars(source.url, source.retrieved_at, source.metadata["stars"]))
+                await persist(RESEARCH_FILES[channel], research_markdown(channel, selected, channel_status[channel], demo))
+            await persist("research.json", dump({"sources": [s.model_dump() for s in sources],
+                                                            "channels": channel_status, "exclusions": exclusions}))
+            await persist("context_summary.json", dump(context_summary))
+            await persist("focus_plan.json", dump(plan.model_dump()))
+            manifest["channels"] = channel_status
+            for channel, name in CHANNEL_SERVERS.items():
+                if settings.mcps[name].required and not channel_status[channel]["count"]:
+                    raise PipelineError(f"Required research channel {channel} returned no qualifying sources. See research.json.")
+            if settings.newsletter.require_web_sources and not channel_status["web"]["count"]:
+                raise PipelineError("No qualifying web sources; refusing to generate a news edition")
+            phase("drafting")
+            # Stage boundary is real: Stage 2 re-reads all five saved research files through MCP.
+            # Their contents remain local artifacts; only compact, source-bounded evidence is sent to each writer call.
+            research_notes = {filename: await hub.read(prefix + filename) for filename in RESEARCH_FILES.values()}
+            draft = fixtures.draft(sources) if demo else await build_staged_draft(
+                llm, brief=public_brief | {"channel_status": channel_status,
+                                            "research_file_names": list(research_notes)},
+                sources=sources, focus_plan=plan.model_dump(), private_context=private_context)
+            validate_references(draft, sources)
+            if any(call.get("context_truncated") for call in llm.audit):
+                warnings.append("Model context excerpts were shortened to fit the configured input budget; review full local research records.")
+            editorial = render_issue(draft, sources, channel_status, name=settings.newsletter.name,
+                                     author=settings.newsletter.author, issue_date=publication_time[:10], demo=demo,
+                                     include_html=False)
+            await persist("draft.json", dump(draft.model_dump()))
+            await persist("final_draft_newsletter.md", editorial["final_draft_newsletter.md"])
+            store.update(identifier, "drafting", has_draft=True, title=draft.title)
+            phase("designing")
+            # EXACT Stage 3 input: read the final saved Markdown through Filesystem MCP.
+            markdown = await hub.read(prefix + "final_draft_newsletter.md")
+            package, phase3_report = await build_email(settings, llm, markdown, name=settings.newsletter.name,
+                author=settings.newsletter.author, issue_date=publication_time[:10], demo=demo)
+            phase("validating")
+            artifacts = {"newsletter.html": package.html, "newsletter.txt": package.text,
+                         "newsletter.eml": eml_package(draft.title, package), "phase3_report.json": dump(phase3_report)}
+            manifest["phase3"] = phase3_report
+            quality = {"source_ids_valid": True, "source_urls_from_tool_records": True,
+                       "nine_sections_present": True, "semantic_fact_check": "NOT automatically verified; human review required",
+                       "email_client_matrix": "Not tested in Gmail, Outlook or Apple Mail",
+                       "phase3": phase3_report,
+                       "code_execution": "Tutorial code was not executed", "source_count": len(sources),
+                       "excluded_records": exclusions, "warnings": warnings,
+                       "evidence_limits": ["Web results are search excerpts", "arXiv summaries use abstracts",
+                                           "GitHub stars are snapshots, not weekly growth unless an interval is explicitly recorded",
+                                           "Product descriptions and social posts are not independently verified"]}
+            artifacts["quality_report.json"] = dump(quality)
+            phase("packaging")
+            for filename, content in artifacts.items():
+                await persist(filename, content)
+            manifest.update(status="awaiting_review", llm_audit=llm.audit, mcp_audit=hub.audit.copy())
+            await hub.write(prefix + "manifest.json", dump(manifest))
+            store.update(identifier, "awaiting_review", source_count=len(sources), warnings=warnings,
+                         publication_time=publication_time, title=draft.title, has_package=True, phase3_engine=phase3_report["engine"])
+            if progress:
+                progress("awaiting_review")
+            return manifest
+    except asyncio.CancelledError:
+        manifest.update(status="cancelled", failed_phase=current_phase, llm_audit=llm.audit,
+                        error="Run cancelled; completed stage artifacts were retained")
+        store.update(identifier, "cancelled", error=manifest["error"], failed_phase=current_phase)
+        try:
+            async with artifact_client(settings) as client:
+                await client.call("write_text", {"path": prefix + "manifest.json", "text": dump(manifest), "overwrite": True})
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        error = str(exc)[:600] if isinstance(exc, (PipelineError, RuntimeError)) else f"Run failed ({type(exc).__name__})"
+        manifest.update(status="failed", error=error, failed_phase=current_phase, llm_audit=llm.audit)
+        store.update(identifier, "failed", error=error, failed_phase=current_phase)
+        store.event(identifier, "failed", error)
+        try:
+            async with artifact_client(settings) as client:
+                await client.call("write_text", {"path": prefix + "manifest.json", "text": dump(manifest), "overwrite": True})
+        except Exception:
+            pass
+        raise PipelineError(f"Run {identifier}: {error}") from exc
+    finally:
+        lock.release()
+
+
+async def approve_run(settings: Settings, identifier: str, reviewer: str) -> dict:
+    valid_run_id(identifier)
+    if not reviewer.strip() or len(reviewer) > 120:
+        raise PipelineError("Provide a reviewer name (1-120 characters)")
+    lock = FileLock(str(settings.workspace / ".pipeline.lock"), timeout=0)
+    try:
+        lock.acquire()
+    except Timeout as exc:
+        raise PipelineError("Another operation is active in this workspace") from exc
+    try:
+        async with artifact_client(settings) as client:
+            prefix = f"issues/{identifier}/"
+            manifest = json.loads((await client.call("read_text", {"path": prefix + "manifest.json"}))["text"])
+            if manifest.get("demo"):
+                raise PipelineError("Synthetic demonstration editions cannot be approved for publication")
+            if manifest.get("status") not in {"awaiting_review", "approved"}:
+                raise PipelineError("Only a completed edition can be approved")
+            required = {"draft.json", "research.json", "newsletter.html", "newsletter.txt", "quality_report.json"}
+            if not required.issubset(manifest.get("files", {})):
+                raise PipelineError("Manifest is incomplete; cannot approve")
+            for filename, expected in manifest.get("files", {}).items():
+                text = (await client.call("read_text", {"path": prefix + filename}))["text"]
+                if hashlib.sha256(text.encode()).hexdigest() != expected:
+                    raise PipelineError(f"{filename} changed after packaging; repackage and review before approval")
+            approval = {"run_id": identifier, "reviewer": reviewer.strip(), "approved_at": utc_now(),
+                        "artifact_hashes": manifest["files"], "scope": "Editorial review only; no email was sent"}
+            await client.call("write_text", {"path": prefix + "approval.json", "text": dump(approval), "overwrite": True})
+            manifest["status"] = "approved"
+            await client.call("write_text", {"path": prefix + "manifest.json", "text": dump(manifest), "overwrite": True})
+            StateStore(settings.workspace).update(identifier, "approved", reviewer=reviewer.strip())
+            return approval
+    finally:
+        lock.release()
+
+
+async def repackage_run(settings: Settings, identifier: str, provider: str | None = None) -> dict:
+    """Resume ONLY Phase 3 from saved Markdown. Does not repeat research or editorial calls."""
+    valid_run_id(identifier)
+    settings = settings.model_copy(deep=True)
+    if provider:
+        if provider not in LLM_MODES:
+            raise PipelineError("Unknown LLM mode")
+        settings.llm.provider = provider
+    lock = FileLock(str(settings.workspace / ".pipeline.lock"), timeout=0)
+    try:
+        lock.acquire()
+    except Timeout as exc:
+        raise PipelineError("Another operation is active") from exc
+    store = StateStore(settings.workspace)
+    llm = LLMClient(settings)
+    manifest = None
+    try:
+        async with artifact_client(settings) as client:
+            prefix = f"issues/{identifier}/"
+            async def read(name):
+                return (await client.call("read_text", {"path": prefix + name}))["text"]
+            manifest = json.loads(await read("manifest.json"))
+            markdown = await read("final_draft_newsletter.md")
+            validate_markdown(markdown)
+            title = validate_markdown(markdown).find("h1")
+            title_text = title.get_text(" ", strip=True) if title else "Newsletter"
+            store.update(identifier, "designing")
+            store.event(identifier, "designing", "Retrying Phase 3 from saved Markdown; research was not repeated")
+            package, report = await build_email(settings, llm, markdown, name=settings.newsletter.name,
+                author=settings.newsletter.author, issue_date=manifest.get("publication_time", utc_now())[:10], demo=manifest["demo"])
+            try:
+                quality = json.loads(await read("quality_report.json"))
+            except Exception:
+                quality = {"semantic_fact_check": "NOT automatically verified; human review required"}
+            quality.update(phase3=report, manual_edit=manifest.get("manual_edit", False))
+            rendered = {"newsletter.html": package.html, "newsletter.txt": package.text,
+                        "newsletter.eml": eml_package(title_text, package), "phase3_report.json": dump(report),
+                        "quality_report.json": dump(quality)}
+            manifest.setdefault("files", {})["final_draft_newsletter.md"] = hashlib.sha256(markdown.encode()).hexdigest()
+            for name, content in rendered.items():
+                await client.call("write_text", {"path": prefix + name, "text": content, "overwrite": True})
+                manifest["files"][name] = hashlib.sha256(content.encode()).hexdigest()
+            manifest.update(status="awaiting_review", repackaged_at=utc_now(), prior_approval_invalidated=True, phase3=report)
+            manifest.pop("error", None)
+            manifest.setdefault("llm_audit", []).extend(llm.audit)
+            await client.call("write_text", {"path": prefix + "approval.json", "text": dump({"valid": False, "reason": "Repackaged; review again"}), "overwrite": True})
+            await client.call("write_text", {"path": prefix + "manifest.json", "text": dump(manifest), "overwrite": True})
+            store.update(identifier, "awaiting_review", title=title_text, has_package=True, phase3_engine=report["engine"], error="")
+            store.event(identifier, "awaiting_review", "Phase 3 completed; editorial review required")
+            return manifest
+    except BaseException as exc:
+        cancelled = isinstance(exc, asyncio.CancelledError)
+        error = "Phase 3 cancelled; draft retained" if cancelled else str(exc)[:1200]
+        status = "cancelled" if cancelled else "failed"
+        store.update(identifier, status, error=error, failed_phase="designing")
+        if manifest:
+            manifest.update(status=status, error=error, failed_phase="designing")
+            manifest.setdefault("llm_audit", []).extend(llm.audit)
+            try:
+                async with artifact_client(settings) as client:
+                    await client.call("write_text", {"path": f"issues/{identifier}/manifest.json", "text": dump(manifest), "overwrite": True})
+            except Exception:
+                pass
+        if cancelled:
+            raise
+        raise PipelineError(error) from exc
+    finally:
+        lock.release()
+
+
+async def save_markdown(settings: Settings, identifier: str, markdown: str) -> dict:
+    """Manual editorial changes invalidate exports/approval until Phase 3 runs again."""
+    valid_run_id(identifier)
+    try:
+        validate_markdown(markdown)
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from exc
+    lock = FileLock(str(settings.workspace / ".pipeline.lock"), timeout=0)
+    try:
+        lock.acquire()
+    except Timeout as exc:
+        raise PipelineError("Another operation is active") from exc
+    try:
+        async with artifact_client(settings) as client:
+            prefix = f"issues/{identifier}/"
+            manifest = json.loads((await client.call("read_text", {"path": prefix + "manifest.json"}))["text"])
+            await client.call("write_text", {"path": prefix + "final_draft_newsletter.md", "text": markdown, "overwrite": True})
+            manifest["files"]["final_draft_newsletter.md"] = hashlib.sha256(markdown.encode()).hexdigest()
+            manifest.update(status="needs_packaging", manual_edit=True, prior_approval_invalidated=True)
+            for name in ("newsletter.html", "newsletter.txt", "newsletter.eml", "phase3_report.json"):
+                manifest["files"].pop(name, None)
+            await client.call("write_text", {"path": prefix + "approval.json", "text": dump({"valid": False, "reason": "Draft edited; regenerate and review"}), "overwrite": True})
+            await client.call("write_text", {"path": prefix + "manifest.json", "text": dump(manifest), "overwrite": True})
+            StateStore(settings.workspace).update(identifier, "needs_packaging", has_draft=True, has_package=False)
+            return {"run_id": identifier, "status": "needs_packaging"}
+    finally:
+        lock.release()
